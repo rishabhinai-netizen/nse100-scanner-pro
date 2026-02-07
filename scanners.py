@@ -18,6 +18,7 @@ class ScanResult:
     symbol: str
     strategy: str
     signal: str  # "BUY" or "SHORT"
+    cmp: float  # Current Market Price (latest close)
     entry: float
     stop_loss: float
     target_1: float
@@ -26,9 +27,9 @@ class ScanResult:
     risk_reward: float
     confidence: int  # 0-100
     reasons: List[str]
+    entry_type: str = "AT CMP"  # "AT CMP", "ABOVE ₹xxx", "LIMIT ₹xxx"
     sector: str = ""
     rs_rating: float = 50.0
-    close: float = 0.0
     volume_ratio: float = 0.0
     rsi: float = 50.0
     hold_type: str = "Swing"
@@ -38,23 +39,12 @@ class ScanResult:
     def risk_pct(self) -> float:
         return abs((self.entry - self.stop_loss) / self.entry * 100)
     
-    def to_dict(self) -> dict:
-        return {
-            "Symbol": self.symbol,
-            "Strategy": self.strategy,
-            "Signal": self.signal,
-            "Entry": round(self.entry, 2),
-            "Stop Loss": round(self.stop_loss, 2),
-            "Target 1": round(self.target_1, 2),
-            "Target 2": round(self.target_2, 2),
-            "Risk:Reward": f"1:{self.risk_reward:.1f}",
-            "Confidence": f"{self.confidence}%",
-            "RS Rating": round(self.rs_rating, 1),
-            "Vol Ratio": f"{self.volume_ratio:.1f}x",
-            "RSI": round(self.rsi, 1),
-            "Hold": self.hold_type,
-            "Sector": self.sector,
-        }
+    @property
+    def entry_gap_pct(self) -> float:
+        """How far is entry from CMP."""
+        if self.cmp == 0:
+            return 0
+        return abs((self.entry - self.cmp) / self.cmp * 100)
 
 
 # ============================================================================
@@ -241,9 +231,20 @@ def scan_vcp(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 95)
     
-    # Entry/Stop/Target
-    entry = round(high_10 * 1.002, 2)  # Just above pivot
+    # Entry/Stop/Target — Entry at CMP or just above pivot
+    cmp = round(latest["close"], 2)
+    pivot = round(high_10 * 1.002, 2)
     atr = latest["atr_14"]
+    
+    # If CMP is already above pivot → entry at CMP (breakout in progress)
+    # If CMP is below pivot → entry is pending above pivot
+    if cmp >= pivot * 0.99:
+        entry = cmp
+        entry_type = "AT CMP"
+    else:
+        entry = pivot
+        entry_type = f"ABOVE ₹{pivot:,.2f}"
+    
     stop_loss = round(max(low_10, entry - 2 * atr), 2)
     risk = entry - stop_loss
     
@@ -254,15 +255,16 @@ def scan_vcp(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
         symbol=symbol,
         strategy="VCP",
         signal="BUY",
+        cmp=cmp,
         entry=entry,
         stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 3 * risk, 2),
         target_3=round(entry + 5 * risk, 2),
-        risk_reward=round(3 * risk / risk, 1),
+        risk_reward=round(3, 1),
         confidence=confidence,
         reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type=entry_type,
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Swing (15-40 days)",
@@ -334,7 +336,8 @@ def scan_ema21_bounce(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 90)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
     stop_loss = round(ema_21 - atr, 2)
     risk = entry - stop_loss
@@ -344,13 +347,13 @@ def scan_ema21_bounce(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     return ScanResult(
         symbol=symbol, strategy="EMA21_Bounce", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 2.5 * risk, 2),
         target_3=round(entry + 4 * risk, 2),
         risk_reward=round(2.5, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Swing (5-15 days)",
@@ -419,7 +422,8 @@ def scan_52wh_breakout(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 92)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
     stop_loss = round(max(low_60, entry - 2.5 * atr), 2)
     risk = entry - stop_loss
@@ -429,13 +433,13 @@ def scan_52wh_breakout(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     return ScanResult(
         symbol=symbol, strategy="52WH_Breakout", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 2 * risk, 2),
         target_2=round(entry + 4 * risk, 2),
         target_3=round(entry + 8 * risk, 2),
         risk_reward=round(4, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Positional (20-60 days)",
@@ -494,7 +498,8 @@ def scan_last30min_ath(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 90)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
     stop_loss = round(entry - 1.5 * atr, 2)
     risk = entry - stop_loss
@@ -504,13 +509,13 @@ def scan_last30min_ath(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     return ScanResult(
         symbol=symbol, strategy="Last30Min_ATH", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 2.5 * risk, 2),
         target_3=round(entry + 4 * risk, 2),
         risk_reward=round(2.5, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP (buy 3:25 PM)",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Overnight",
@@ -581,9 +586,10 @@ def scan_failed_breakout_short(df: pd.DataFrame, symbol: str) -> Optional[ScanRe
     
     confidence = min(confidence, 88)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
-    stop_loss = round(high_5 * 1.01, 2)  # Above recent high
+    stop_loss = round(high_5 * 1.01, 2)
     risk = stop_loss - entry
     
     if risk <= 0:
@@ -591,13 +597,13 @@ def scan_failed_breakout_short(df: pd.DataFrame, symbol: str) -> Optional[ScanRe
     
     return ScanResult(
         symbol=symbol, strategy="Failed_Breakout_Short", signal="SHORT",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry - 1.5 * risk, 2),
         target_2=round(entry - 2.5 * risk, 2),
         target_3=round(entry - 4 * risk, 2),
         risk_reward=round(2.5, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP (short)",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Swing (3-10 days)",
@@ -656,7 +662,8 @@ def scan_orb_daily_proxy(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 82)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
     stop_loss = round(latest["low"], 2)
     risk = entry - stop_loss
@@ -666,13 +673,13 @@ def scan_orb_daily_proxy(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     return ScanResult(
         symbol=symbol, strategy="ORB", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 2.5 * risk, 2),
         target_3=round(entry + 3.5 * risk, 2),
         risk_reward=round(2.5, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_9"], 1),
         hold_type="Intraday/Next Day",
@@ -730,7 +737,8 @@ def scan_vwap_reclaim_daily(df: pd.DataFrame, symbol: str) -> Optional[ScanResul
     
     confidence = min(confidence, 78)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     atr = latest["atr_14"]
     stop_loss = round(latest["low"] - 0.5 * atr, 2)
     risk = entry - stop_loss
@@ -740,13 +748,13 @@ def scan_vwap_reclaim_daily(df: pd.DataFrame, symbol: str) -> Optional[ScanResul
     
     return ScanResult(
         symbol=symbol, strategy="VWAP_Reclaim", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 2 * risk, 2),
         target_3=round(entry + 3 * risk, 2),
         risk_reward=round(2, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Intraday/Swing",
@@ -812,7 +820,8 @@ def scan_lunch_low_daily(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     confidence = min(confidence, 78)
     
-    entry = round(latest["close"], 2)
+    cmp = round(latest["close"], 2)
+    entry = cmp
     stop_loss = round(latest["low"] - latest["atr_14"] * 0.3, 2)
     risk = entry - stop_loss
     
@@ -821,13 +830,13 @@ def scan_lunch_low_daily(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
     
     return ScanResult(
         symbol=symbol, strategy="Lunch_Low", signal="BUY",
-        entry=entry, stop_loss=stop_loss,
+        cmp=cmp, entry=entry, stop_loss=stop_loss,
         target_1=round(entry + 1.5 * risk, 2),
         target_2=round(entry + 2 * risk, 2),
         target_3=round(entry + 3 * risk, 2),
         risk_reward=round(2, 1),
         confidence=confidence, reasons=reasons,
-        close=round(latest["close"], 2),
+        entry_type="AT CMP",
         volume_ratio=round(vol_ratio, 1),
         rsi=round(latest["rsi_14"], 1),
         hold_type="Intraday/Swing",
