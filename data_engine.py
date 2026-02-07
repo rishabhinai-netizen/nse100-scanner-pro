@@ -1,5 +1,5 @@
 """
-Data Engine — Fetches OHLCV data from yfinance (daily) + ICICI Breeze (intraday)
+Data Engine — yfinance (daily, rate-limited) + ICICI Breeze (intraday, from st.secrets)
 """
 
 import pandas as pd
@@ -8,19 +8,27 @@ import yfinance as yf
 import streamlit as st
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
-import os
+import time as time_module
+import pytz
 import logging
 
 logger = logging.getLogger(__name__)
 
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    """Current time in IST."""
+    return datetime.now(IST)
+
 
 # ============================================================================
-# YFINANCE DATA ENGINE (FREE — DAILY DATA)
+# YFINANCE DATA ENGINE (FREE — DAILY DATA, RATE-LIMITED)
 # ============================================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_daily_data(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
-    """Fetch daily OHLCV data from yfinance."""
+    """Fetch daily OHLCV data from yfinance for a single symbol."""
     try:
         yf_symbol = f"{symbol}.NS"
         ticker = yf.Ticker(yf_symbol)
@@ -28,42 +36,90 @@ def fetch_daily_data(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
         if df.empty or len(df) < 50:
             return None
         df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert(IST).tz_localize(None)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df.columns = ["open", "high", "low", "close", "volume"]
         df["symbol"] = symbol
         return df
     except Exception as e:
-        logger.warning(f"Failed to fetch {symbol}: {e}")
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_batch_daily(symbols: List[str], period: str = "1y") -> Dict[str, pd.DataFrame]:
-    """Fetch daily data for multiple symbols efficiently."""
+def fetch_batch_daily(symbols: List[str], period: str = "1y",
+                      progress_callback=None) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch daily data in batches to avoid yfinance rate limits.
+    Batches of 40 symbols with 2-second delay between batches.
+    """
     results = {}
-    yf_symbols = [f"{s}.NS" for s in symbols]
-    try:
-        data = yf.download(yf_symbols, period=period, auto_adjust=True, 
-                          threads=True, progress=False, group_by="ticker")
-        for symbol, yf_sym in zip(symbols, yf_symbols):
-            try:
-                if len(symbols) == 1:
-                    df = data.copy()
-                else:
-                    df = data[yf_sym].copy() if yf_sym in data.columns.get_level_values(0) else None
-                if df is not None and not df.empty and len(df) >= 50:
-                    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                    df.columns = ["open", "high", "low", "close", "volume"]
-                    df["symbol"] = symbol
+    batch_size = 40
+    total = len(symbols)
+    
+    for i in range(0, total, batch_size):
+        batch = symbols[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (total + batch_size - 1) // batch_size
+        
+        if progress_callback:
+            progress_callback(i / total, f"Batch {batch_num}/{total_batches}: Fetching {len(batch)} stocks...")
+        
+        yf_symbols = [f"{s}.NS" for s in batch]
+        
+        try:
+            raw = yf.download(
+                yf_symbols, period=period, auto_adjust=True,
+                threads=True, progress=False, group_by="ticker"
+            )
+            
+            if raw is not None and not raw.empty:
+                for symbol, yf_sym in zip(batch, yf_symbols):
+                    try:
+                        if len(batch) == 1:
+                            df = raw.copy()
+                        elif isinstance(raw.columns, pd.MultiIndex):
+                            if yf_sym in raw.columns.get_level_values(0):
+                                df = raw[yf_sym].copy()
+                            else:
+                                continue
+                        else:
+                            df = raw.copy()
+                        
+                        if df is not None and not df.empty:
+                            df = df.dropna(how="all")
+                            if len(df) >= 50:
+                                # Normalize columns
+                                col_map = {}
+                                for c in df.columns:
+                                    cl = str(c).lower()
+                                    if "open" in cl: col_map[c] = "open"
+                                    elif "high" in cl: col_map[c] = "high"
+                                    elif "low" in cl: col_map[c] = "low"
+                                    elif "close" in cl: col_map[c] = "close"
+                                    elif "volume" in cl or "vol" in cl: col_map[c] = "volume"
+                                df = df.rename(columns=col_map)
+                                
+                                needed = ["open", "high", "low", "close", "volume"]
+                                if all(c in df.columns for c in needed):
+                                    df = df[needed]
+                                    # Fix timezone
+                                    if df.index.tz is not None:
+                                        df.index = df.index.tz_convert(IST).tz_localize(None)
+                                    df["symbol"] = symbol
+                                    results[symbol] = df
+                    except Exception:
+                        continue
+        except Exception as e:
+            # Fallback: fetch individually for this batch
+            for symbol in batch:
+                df = fetch_daily_data(symbol, period)
+                if df is not None:
                     results[symbol] = df
-            except Exception:
-                continue
-    except Exception as e:
-        logger.warning(f"Batch download failed, falling back to individual: {e}")
-        for symbol in symbols:
-            df = fetch_daily_data(symbol, period)
-            if df is not None:
-                results[symbol] = df
+        
+        # Rate limit delay between batches (except last batch)
+        if i + batch_size < total:
+            time_module.sleep(1.5)
+    
     return results
 
 
@@ -77,37 +133,83 @@ def fetch_nifty_data(period: str = "1y") -> Optional[pd.DataFrame]:
             return None
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df.columns = ["open", "high", "low", "close", "volume"]
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert(IST).tz_localize(None)
         return df
     except Exception:
         return None
 
 
 # ============================================================================
-# ICICI BREEZE API ENGINE (OPTIONAL — INTRADAY DATA)
+# ICICI BREEZE API ENGINE — reads from Streamlit Secrets
 # ============================================================================
 
 class BreezeEngine:
-    """ICICI Breeze API integration for real-time intraday data."""
+    """
+    ICICI Breeze API integration.
+    Credentials are read from Streamlit secrets (Settings > Secrets).
+    Session token must be regenerated daily from ICICI Direct portal.
+    """
     
     def __init__(self):
         self.connected = False
         self.breeze = None
-        
+        self.connection_message = ""
+    
+    def connect_from_secrets(self) -> Tuple[bool, str]:
+        """Connect using credentials stored in Streamlit secrets."""
+        try:
+            api_key = st.secrets.get("BREEZE_API_KEY", "")
+            api_secret = st.secrets.get("BREEZE_API_SECRET", "")
+            session_token = st.secrets.get("BREEZE_SESSION_TOKEN", "")
+            
+            if not api_key or not api_secret or not session_token:
+                return False, "Breeze credentials not found in Streamlit secrets. Add them in Settings > Secrets."
+            
+            if api_key == "your_api_key_here":
+                return False, "Breeze credentials are placeholder values. Update them with real credentials."
+            
+            return self.connect(api_key, api_secret, session_token)
+        except Exception as e:
+            return False, f"Error reading secrets: {str(e)}"
+    
     def connect(self, api_key: str, api_secret: str, session_token: str) -> Tuple[bool, str]:
-        """Connect to ICICI Breeze API."""
+        """Connect to ICICI Breeze API with validation."""
         try:
             from breeze_connect import BreezeConnect
+            
             self.breeze = BreezeConnect(api_key=api_key)
             self.breeze.generate_session(api_secret=api_secret, session_token=session_token)
-            self.connected = True
-            return True, "Connected to ICICI Breeze API successfully!"
+            
+            # VALIDATE connection by making a test call
+            test = self.breeze.get_customer_details(api_key=api_key)
+            if test and test.get("Status") and "Success" in str(test.get("Status", "")):
+                self.connected = True
+                self.connection_message = "✅ Breeze API connected and validated!"
+                return True, self.connection_message
+            elif test and test.get("Success"):
+                self.connected = True
+                self.connection_message = "✅ Breeze API connected!"
+                return True, self.connection_message
+            else:
+                # Connection might still work even if customer details fails
+                self.connected = True
+                self.connection_message = "✅ Breeze API connected (limited validation)."
+                return True, self.connection_message
+                
         except ImportError:
-            return False, "breeze-connect package not installed. Run: pip install breeze-connect"
+            return False, "❌ breeze-connect not installed. Run: pip install breeze-connect"
         except Exception as e:
+            err = str(e)
             self.connected = False
-            return False, f"Connection failed: {str(e)}"
+            if "Invalid Session" in err or "session" in err.lower():
+                return False, "❌ Session token expired. Generate a new one from ICICI Direct portal."
+            elif "Invalid" in err:
+                return False, f"❌ Invalid credentials: {err}"
+            else:
+                return False, f"❌ Connection failed: {err}"
     
-    def fetch_intraday(self, symbol: str, interval: str = "5minute", 
+    def fetch_intraday(self, symbol: str, interval: str = "5minute",
                        days_back: int = 5) -> Optional[pd.DataFrame]:
         """Fetch intraday data from Breeze API."""
         if not self.connected or self.breeze is None:
@@ -116,12 +218,11 @@ class BreezeEngine:
             from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT07:00:00.000Z")
             to_date = datetime.now().strftime("%Y-%m-%dT23:59:59.000Z")
             
-            nse_symbol = self._map_symbol(symbol)
             data = self.breeze.get_historical_data_v2(
                 interval=interval,
                 from_date=from_date,
                 to_date=to_date,
-                stock_code=nse_symbol,
+                stock_code=symbol,
                 exchange_code="NSE",
                 product_type="cash"
             )
@@ -138,16 +239,8 @@ class BreezeEngine:
                 return df
             return None
         except Exception as e:
-            logger.warning(f"Breeze intraday fetch failed for {symbol}: {e}")
+            logger.warning(f"Breeze intraday failed for {symbol}: {e}")
             return None
-    
-    def _map_symbol(self, symbol: str) -> str:
-        """Map common symbol names to Breeze stock codes."""
-        mapping = {
-            "M&M": "MARUTI",  # Breeze may use different codes
-            "BAJAJ-AUTO": "BAJAJ-AUTO",
-        }
-        return mapping.get(symbol, symbol)
 
 
 # ============================================================================
@@ -215,7 +308,6 @@ class Indicators:
     
     @staticmethod
     def relative_strength(stock_df: pd.DataFrame, nifty_df: pd.DataFrame, period: int = 63) -> float:
-        """Calculate RS rating vs Nifty (0-100 percentile)."""
         if stock_df is None or nifty_df is None or len(stock_df) < period or len(nifty_df) < period:
             return 50.0
         stock_ret = (stock_df["close"].iloc[-1] / stock_df["close"].iloc[-period] - 1) * 100
@@ -240,12 +332,7 @@ class Indicators:
         df["vol_sma_50"] = Indicators.sma(df["volume"], 50)
         df["macd"], df["macd_signal"], df["macd_hist"] = Indicators.macd(df["close"])
         df["bb_upper"], df["bb_mid"], df["bb_lower"] = Indicators.bollinger_bands(df["close"])
-        
-        # 52-week high/low
         df["high_52w"] = df["high"].rolling(window=250, min_periods=50).max()
         df["low_52w"] = df["low"].rolling(window=250, min_periods=50).min()
-        
-        # Price vs key levels
         df["pct_from_52w_high"] = (df["close"] / df["high_52w"] - 1) * 100
-        
         return df
